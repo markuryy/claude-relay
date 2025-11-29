@@ -1,0 +1,14 @@
+{
+  "name": "claude-relay",
+  "version": "1.0.0",
+  "description": "WebSocket relay + MCP server for M1 <-> M2 Claude Code communication",
+  "main": "server.js",
+  "scripts": {
+    "server": "node server.js",
+    "mcp": "node mcp-server.js",
+    "test-client": "node test-client.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
