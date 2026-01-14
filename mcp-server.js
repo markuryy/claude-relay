@@ -5,16 +5,23 @@
  * MCP server that provides tools for Claude Code to communicate
  * with peer instances via the WebSocket relay.
  *
- * Usage: node mcp-server.js [--client-id=M2] [--relay-url=ws://localhost:9999]
+ * Usage: node mcp-server.js [--client-id=CC-1] [--relay-url=ws://localhost:9999]
  *
- * Environment variables:
- *   RELAY_CLIENT_ID - Client identifier (M1, M2, etc.)
+ * Environment variables (priority order):
+ *   CLAUDE_RELAY_SESSION_ID - Preferred session ID (set via `claude-session CC-1`)
+ *   RELAY_CLIENT_ID - Client identifier fallback
  *   RELAY_URL - WebSocket relay server URL
+ *
+ * Session Registry:
+ *   Sessions are tracked in ~/claude-relay/sessions/registry.json
+ *   Use `relay_sessions` MCP tool to list all registered sessions
  */
 
 const WebSocket = require('ws');
 const readline = require('readline');
 const os = require('os');
+const fs = require('fs');
+const path = require('path');
 
 // Configuration from args or env
 const args = process.argv.slice(2).reduce((acc, arg) => {
@@ -23,12 +30,62 @@ const args = process.argv.slice(2).reduce((acc, arg) => {
   return acc;
 }, {});
 
-// If explicit client-id provided, use as-is; otherwise add PID suffix for uniqueness
+// Session ID priority: CLAUDE_RELAY_SESSION_ID > --client-id > RELAY_CLIENT_ID > hostname-pid
+const sessionId = process.env.CLAUDE_RELAY_SESSION_ID;
 const explicitId = args['client-id'] || process.env.RELAY_CLIENT_ID;
-const baseId = explicitId || os.hostname().split('.')[0].toUpperCase();
+const baseId = sessionId || explicitId || os.hostname().split('.')[0].toUpperCase();
 const suffix = process.pid.toString(36);
-const CLIENT_ID = explicitId ? baseId : `${baseId}-${suffix}`;
+const CLIENT_ID = (sessionId || explicitId) ? baseId : `${baseId}-${suffix}`;
 const RELAY_URL = args['relay-url'] || process.env.RELAY_URL || 'ws://localhost:9999';
+
+// Session registry path
+const SESSIONS_DIR = path.join(os.homedir(), 'claude-relay', 'sessions');
+const REGISTRY_FILE = path.join(SESSIONS_DIR, 'registry.json');
+
+// Ensure sessions directory exists
+try {
+  fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+} catch {}
+
+/**
+ * Update the session registry with this client's info
+ */
+function updateRegistry(action = 'connect') {
+  try {
+    let registry = {};
+    if (fs.existsSync(REGISTRY_FILE)) {
+      registry = JSON.parse(fs.readFileSync(REGISTRY_FILE, 'utf8'));
+    }
+
+    if (action === 'connect') {
+      registry[CLIENT_ID] = {
+        pid: process.pid,
+        started: new Date().toISOString(),
+        cwd: process.cwd(),
+        relayUrl: RELAY_URL,
+        source: sessionId ? 'CLAUDE_RELAY_SESSION_ID' : (explicitId ? 'explicit' : 'auto')
+      };
+    } else if (action === 'disconnect') {
+      delete registry[CLIENT_ID];
+    }
+
+    fs.writeFileSync(REGISTRY_FILE, JSON.stringify(registry, null, 2));
+  } catch (err) {
+    // Non-fatal: don't interrupt MCP operation for registry issues
+  }
+}
+
+/**
+ * Read all sessions from registry
+ */
+function readRegistry() {
+  try {
+    if (fs.existsSync(REGISTRY_FILE)) {
+      return JSON.parse(fs.readFileSync(REGISTRY_FILE, 'utf8'));
+    }
+  } catch {}
+  return {};
+}
 
 // State
 let ws = null;
@@ -141,6 +198,14 @@ function handleMcpMessage(message) {
             {
               name: 'relay_status',
               description: 'Check connection status to the relay server',
+              inputSchema: {
+                type: 'object',
+                properties: {}
+              }
+            },
+            {
+              name: 'relay_sessions',
+              description: 'List all registered Claude sessions from the local registry (includes offline sessions)',
               inputSchema: {
                 type: 'object',
                 properties: {}
@@ -308,6 +373,37 @@ function handleToolCall(requestId, toolName, args) {
       });
       break;
 
+    case 'relay_sessions':
+      const sessions = readRegistry();
+      const sessionList = Object.entries(sessions);
+      let sessionText = `=== Registered Claude Sessions ===\n`;
+      sessionText += `You are: ${CLIENT_ID}\n\n`;
+
+      if (sessionList.length === 0) {
+        sessionText += 'No sessions registered.';
+      } else {
+        sessionList.forEach(([id, info]) => {
+          const isMe = id === CLIENT_ID ? ' (this session)' : '';
+          const online = peers.includes(id) ? ' [ONLINE]' : '';
+          sessionText += `${id}${isMe}${online}\n`;
+          sessionText += `  PID: ${info.pid} | Started: ${new Date(info.started).toLocaleString()}\n`;
+          sessionText += `  CWD: ${info.cwd}\n`;
+          sessionText += `  Source: ${info.source}\n\n`;
+        });
+      }
+
+      sendMcpResponse({
+        jsonrpc: '2.0',
+        id: requestId,
+        result: {
+          content: [{
+            type: 'text',
+            text: sessionText
+          }]
+        }
+      });
+      break;
+
     default:
       sendMcpResponse({
         jsonrpc: '2.0',
@@ -334,6 +430,8 @@ function connectToRelay() {
       type: 'register',
       clientId: CLIENT_ID
     }));
+    // Update local session registry
+    updateRegistry('connect');
   });
 
   ws.on('message', (data) => {
@@ -436,11 +534,43 @@ function connectToRelay() {
 
 // Handle shutdown
 process.on('SIGINT', () => {
+  updateRegistry('disconnect');
   if (ws) ws.close();
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
+  updateRegistry('disconnect');
   if (ws) ws.close();
   process.exit(0);
 });
+
+// Also clean up on normal exit
+process.on('exit', () => {
+  updateRegistry('disconnect');
+});
+
+/**
+ * Parent process watchdog
+ * MCP servers are spawned by Claude Code. If Claude Code exits unexpectedly,
+ * the MCP server becomes orphaned. This watchdog detects orphaning and exits.
+ */
+const PARENT_PID = process.ppid;
+const WATCHDOG_INTERVAL = 10000; // Check every 10 seconds
+
+function checkParentAlive() {
+  try {
+    // process.kill with signal 0 checks if process exists without killing it
+    process.kill(PARENT_PID, 0);
+  } catch (err) {
+    // Parent process is gone - we're orphaned
+    updateRegistry('disconnect');
+    if (ws) ws.close();
+    process.exit(0);
+  }
+}
+
+// Start watchdog after a brief delay to let initialization complete
+setTimeout(() => {
+  setInterval(checkParentAlive, WATCHDOG_INTERVAL);
+}, 5000);
