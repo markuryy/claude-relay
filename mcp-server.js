@@ -93,6 +93,7 @@ let connected = false;
 let peers = [];
 let pendingMessages = [];
 let messageQueue = [];
+let messageWaiters = [];
 
 // MCP protocol handler
 const rl = readline.createInterface({
@@ -154,7 +155,7 @@ function handleMcpMessage(message) {
           tools: [
             {
               name: 'relay_send',
-              description: `Send a message to peer Claude Code instance(s). You are ${CLIENT_ID}.`,
+              description: `Send a message to peer Claude Code instance(s). You are ${CLIENT_ID}. After sending, call relay_receive with wait=120 to block until a reply arrives.`,
               inputSchema: {
                 type: 'object',
                 properties: {
@@ -172,17 +173,21 @@ function handleMcpMessage(message) {
             },
             {
               name: 'relay_receive',
-              description: 'Get recent messages from peer Claude Code instance(s)',
+              description: 'Get messages from peer Claude Code instance(s). Use wait parameter for long-polling — the call blocks until a new message arrives or timeout, so you don\'t need to poll manually. RECOMMENDED: after sending a message, call relay_receive with wait=120 to automatically wait for the reply.',
               inputSchema: {
                 type: 'object',
                 properties: {
                   count: {
                     type: 'number',
-                    description: 'Maximum number of messages to retrieve (default: 10)'
+                    description: 'Maximum number of messages to retrieve (default: 10). Only used when wait is NOT set.'
                   },
                   from: {
                     type: 'string',
                     description: 'Filter messages by sender ID (optional)'
+                  },
+                  wait: {
+                    type: 'number',
+                    description: 'Long-poll: wait up to this many seconds for NEW messages to arrive (max 300). Returns immediately if messages are already queued. If no messages arrive before timeout, returns "No new messages". Use this after sending a message to wait for a reply without manual polling.'
                   }
                 }
               }
@@ -282,37 +287,107 @@ function handleToolCall(requestId, toolName, args) {
         return;
       }
 
-      // Request history from server
-      const historyRequestId = Date.now();
-      pendingMessages.push({
-        requestId,
-        type: 'history',
-        id: historyRequestId
-      });
+      const waitSeconds = args.wait || 0;
 
-      ws.send(JSON.stringify({
-        type: 'get_history',
-        count: args.count || 10,
-        from: args.from
-      }));
+      if (waitSeconds > 0) {
+        // Long-polling mode: return queued messages or wait for new ones
+        const drainQueue = (fromFilter) => {
+          if (!fromFilter) {
+            const msgs = [...messageQueue];
+            messageQueue = [];
+            return msgs;
+          }
+          const matched = messageQueue.filter(m => m.from === fromFilter);
+          messageQueue = messageQueue.filter(m => m.from !== fromFilter);
+          return matched;
+        };
 
-      // Set timeout for response
-      setTimeout(() => {
-        const idx = pendingMessages.findIndex(p => p.id === historyRequestId);
-        if (idx !== -1) {
-          pendingMessages.splice(idx, 1);
+        const formatMessages = (msgs) =>
+          msgs.map(m => m.type === 'system'
+            ? `[${m.timestamp}] SYSTEM: ${m.content}`
+            : `[${m.timestamp}] ${m.from}: ${m.content}`
+          ).join('\n');
+
+        // Check for already-queued messages
+        const queued = drainQueue(args.from);
+        if (queued.length > 0) {
           sendMcpResponse({
             jsonrpc: '2.0',
             id: requestId,
             result: {
-              content: [{
-                type: 'text',
-                text: 'Timeout waiting for history from relay server'
-              }]
+              content: [{ type: 'text', text: formatMessages(queued) }]
             }
           });
+          return;
         }
-      }, 5000);
+
+        // No messages yet — set up waiter
+        const timeoutMs = Math.min(waitSeconds, 300) * 1000;
+        let resolved = false;
+        const waiterId = Date.now() + Math.random();
+
+        const finish = (timedOut) => {
+          if (resolved) return;
+          resolved = true;
+          clearTimeout(timer);
+          messageWaiters = messageWaiters.filter(w => w.id !== waiterId);
+          // Small delay to batch rapid messages
+          setTimeout(() => {
+            const msgs = drainQueue(args.from);
+            sendMcpResponse({
+              jsonrpc: '2.0',
+              id: requestId,
+              result: {
+                content: [{
+                  type: 'text',
+                  text: msgs.length > 0
+                    ? formatMessages(msgs)
+                    : 'No new messages (timed out)'
+                }]
+              }
+            });
+          }, timedOut ? 0 : 500);
+        };
+
+        const timer = setTimeout(() => finish(true), timeoutMs);
+
+        messageWaiters.push({
+          id: waiterId,
+          fromFilter: args.from || null,
+          resolve: () => finish(false)
+        });
+      } else {
+        // Original mode: fetch history from server
+        const historyRequestId = Date.now();
+        pendingMessages.push({
+          requestId,
+          type: 'history',
+          id: historyRequestId
+        });
+
+        ws.send(JSON.stringify({
+          type: 'get_history',
+          count: args.count || 10,
+          from: args.from
+        }));
+
+        setTimeout(() => {
+          const idx = pendingMessages.findIndex(p => p.id === historyRequestId);
+          if (idx !== -1) {
+            pendingMessages.splice(idx, 1);
+            sendMcpResponse({
+              jsonrpc: '2.0',
+              id: requestId,
+              result: {
+                content: [{
+                  type: 'text',
+                  text: 'Timeout waiting for history from relay server'
+                }]
+              }
+            });
+          }
+        }, 5000);
+      }
       break;
 
     case 'relay_peers':
@@ -485,12 +560,13 @@ function connectToRelay() {
 
         case 'peer_joined':
           peers = msg.peers || [];
-          // Queue notification for next relay_receive
           messageQueue.push({
             type: 'system',
             content: `Peer "${msg.clientId}" joined`,
             timestamp: new Date().toISOString()
           });
+          // Notify waiters (no from filter for system events)
+          messageWaiters.filter(w => !w.fromFilter).forEach(w => w.resolve());
           break;
 
         case 'peer_left':
@@ -500,6 +576,7 @@ function connectToRelay() {
             content: `Peer "${msg.clientId}" left`,
             timestamp: new Date().toISOString()
           });
+          messageWaiters.filter(w => !w.fromFilter).forEach(w => w.resolve());
           break;
 
         case 'message':
@@ -509,6 +586,11 @@ function connectToRelay() {
             content: msg.content,
             timestamp: msg.timestamp
           });
+          // Notify any long-poll waiters
+          const matchingWaiters = messageWaiters.filter(w =>
+            !w.fromFilter || w.fromFilter === msg.from
+          );
+          matchingWaiters.forEach(w => w.resolve());
           break;
 
         case 'error':
