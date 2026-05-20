@@ -357,7 +357,8 @@ function handleToolCall(requestId, toolName, args) {
           resolve: () => finish(false)
         });
       } else {
-        // Original mode: fetch history from server
+        // Original mode: fetch history from server — also drain local queue
+        messageQueue = [];
         const historyRequestId = Date.now();
         pendingMessages.push({
           requestId,
