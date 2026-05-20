@@ -94,6 +94,7 @@ let peers = [];
 let pendingMessages = [];
 let messageQueue = [];
 let messageWaiters = [];
+let shuttingDown = false;
 
 // MCP protocol handler
 const rl = readline.createInterface({
@@ -606,8 +607,9 @@ function connectToRelay() {
   ws.on('close', () => {
     connected = false;
     peers = [];
-    // Attempt reconnect after delay
-    setTimeout(connectToRelay, 5000);
+    if (!shuttingDown) {
+      setTimeout(connectToRelay, 5000);
+    }
   });
 
   ws.on('error', () => {
@@ -617,12 +619,14 @@ function connectToRelay() {
 
 // Handle shutdown
 process.on('SIGINT', () => {
+  shuttingDown = true;
   updateRegistry('disconnect');
   if (ws) ws.close();
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
+  shuttingDown = true;
   updateRegistry('disconnect');
   if (ws) ws.close();
   process.exit(0);

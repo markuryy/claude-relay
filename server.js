@@ -165,12 +165,16 @@ function broadcast(message, excludeClient = null) {
 // Graceful shutdown
 process.on('SIGINT', () => {
   console.log('\n[Claude Relay] Shutting down...');
+  clients.forEach((ws) => ws.terminate());
   wss.close(() => {
     console.log('[Claude Relay] Server closed');
     process.exit(0);
   });
+  setTimeout(() => process.exit(0), 1000);
 });
 
 process.on('SIGTERM', () => {
+  clients.forEach((ws) => ws.terminate());
   wss.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 1000);
 });
